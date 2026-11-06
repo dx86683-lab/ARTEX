@@ -15,7 +15,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api } from "@/lib/api";
+import { api, refreshSseTicket } from "@/lib/api";
+import { auth } from "@/lib/auth";
 
 export function ChangePasswordDialog({
   open,
@@ -51,7 +52,12 @@ export function ChangePasswordDialog({
     setSaving(true);
     api
       .changePassword(oldPassword, newPassword)
-      .then(() => {
+      .then(async ({ token }) => {
+        // 改密会让旧 token 和 SSE 票据一起失效，换上新 token 才能留在当前会话。
+        if (token) {
+          auth.setToken(token);
+          await refreshSseTicket();
+        }
         toast.success("密码已修改");
         onOpenChange(false);
       })

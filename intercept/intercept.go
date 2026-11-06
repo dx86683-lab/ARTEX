@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -79,7 +80,8 @@ func taskEmitFromCtx(ctx context.Context) func(db.Activity) {
 // compiledRule is an InterceptRule with the regex pre-compiled (nil for string rules).
 type compiledRule struct {
 	db.InterceptRule
-	re *regexp.Regexp
+	re     *regexp.Regexp
+	broken bool // regex rule whose pattern no longer compiles; see Match
 }
 
 // pendingManager tracks in-flight "ask" requests via per-request channels.
@@ -176,7 +178,10 @@ func (i *Interceptor) loadLocked() error {
 		if r.MatchType == "regex" {
 			re, err := regexp.Compile(r.Pattern)
 			if err != nil {
-				continue // skip rules with bad regex rather than crashing
+				// Dropping the rule would silently remove a protection the operator
+				// believes is active, so Match escalates it to human approval.
+				log.Printf("[intercept] 规则 #%d %q 正则无效: %v", r.ID, r.Name, err)
+				cr.broken = true
 			}
 			cr.re = re
 		}
@@ -185,25 +190,25 @@ func (i *Interceptor) loadLocked() error {
 	i.cached = out
 
 	// Load enabled-tools set from settings, falling back to hard-coded defaults.
-	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
-	if !ok {
-		m := make(map[string]bool, len(defaultEnabledTools))
-		for _, n := range defaultEnabledTools {
-			m[n] = true
-		}
-		i.enabledTools = m
-	} else {
-		var names []string
-		if json.Unmarshal([]byte(val), &names) != nil {
-			i.enabledTools = map[string]bool{}
+	val, ok, err := i.db.GetSetting("intercept_enabled_tools")
+	if err != nil {
+		return err
+	}
+	names := defaultEnabledTools
+	if ok {
+		var saved []string
+		if err := json.Unmarshal([]byte(val), &saved); err != nil {
+			// A corrupt setting must not turn into "nothing is intercepted".
+			log.Printf("[intercept] intercept_enabled_tools 解析失败，回退默认清单: %v", err)
 		} else {
-			m := make(map[string]bool, len(names))
-			for _, n := range names {
-				m[n] = true
-			}
-			i.enabledTools = m
+			names = saved
 		}
 	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	i.enabledTools = m
 	return nil
 }
 
@@ -227,24 +232,40 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 	return i.cached, nil
 }
 
-// IsToolEnabled returns true if the named tool is in the intercept-enabled set
-// (i.e. it should enter the rule-matching path). Uses the same double-check lock
-// pattern as rules().
+// IsToolEnabled returns true if the named tool should enter the rule-matching path:
+// it is in the configured set, or it can act outside the platform (MCP and custom
+// tools, see isExternalTool). If the configuration cannot be read the answer is true,
+// and Match then reports the same failure as a denial.
 func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.RLock()
-	if i.enabledTools != nil {
-		v := i.enabledTools[name]
-		i.mu.RUnlock()
-		return v
-	}
+	tools := i.enabledTools
 	i.mu.RUnlock()
-
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.enabledTools == nil {
-		_ = i.loadLocked()
+	if tools == nil {
+		i.mu.Lock()
+		if i.enabledTools == nil {
+			if err := i.loadLocked(); err != nil {
+				i.mu.Unlock()
+				return true
+			}
+		}
+		tools = i.enabledTools
+		i.mu.Unlock()
 	}
-	return i.enabledTools[name]
+	return tools[name] || i.isExternalTool(name)
+}
+
+// isExternalTool reports MCP and custom tools. They default to intercepted because an
+// operator can add one at any time, and a custom "command" tool is a shell with another
+// name. Built-in platform tools only touch ARTEX's own state and stay opt-in.
+func (i *Interceptor) isExternalTool(name string) bool {
+	if strings.HasPrefix(name, "mcp__") {
+		return true
+	}
+	t, err := i.db.GetTool(name)
+	if err != nil {
+		return true
+	}
+	return t != nil && !t.System
 }
 
 // GetEnabledTools returns the ordered list of tool names that are currently
@@ -262,7 +283,9 @@ func (i *Interceptor) GetEnabledTools() ([]string, error) {
 	}
 	var names []string
 	if err := json.Unmarshal([]byte(val), &names); err != nil {
-		return []string{}, nil
+		out := make([]string, len(defaultEnabledTools))
+		copy(out, defaultEnabledTools)
+		return out, nil
 	}
 	return names, nil
 }
@@ -313,7 +336,7 @@ const (
 // Judge default values.
 const (
 	defaultJudgeTimeoutSecs      = 15
-	defaultJudgeFailAction       = "allow"
+	defaultJudgeFailAction       = "ask" // a judge that cannot answer has not approved anything
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
 )
@@ -507,11 +530,33 @@ func judgeActionLabel(action string) string {
 // (Decision{}, false) if no rule matches.
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
-	if err != nil || len(rules) == 0 {
+	if err != nil {
+		// Without the rules we cannot say the call is safe.
+		log.Printf("[intercept] 读取拦截规则失败，拒绝工具 %s: %v", toolName, err)
+		return Decision{Action: "deny", Message: "拦截规则暂时不可用，无法确认此调用是否安全"}, true
+	}
+	if len(rules) == 0 {
 		return Decision{}, false
 	}
+	subjects := inputSubjects(input)
 	for _, r := range rules {
-		if ruleMatches(r, toolName, input) {
+		if r.broken {
+			// The rule's intent is unknown. An allow rule cannot grant anything; a deny
+			// or ask rule might have matched this call, so a human decides.
+			if r.Action == "allow" {
+				continue
+			}
+			return Decision{
+				Action:         "ask",
+				Message:        "拦截规则 [" + r.Name + "] 的正则无效，请修复规则并人工确认此调用",
+				RuleID:         r.ID,
+				RuleName:       r.Name,
+				TimeoutEnabled: true,
+				TimeoutSeconds: defaultJudgeAskTimeoutSecs,
+				TimeoutAction:  "deny",
+			}, true
+		}
+		if ruleMatches(r, toolName, subjects) {
 			msg := r.Message
 			if msg == "" {
 				msg = defaultMessage(r.Action, r.Name)
@@ -531,20 +576,66 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	return Decision{}, false
 }
 
-func ruleMatches(r compiledRule, toolName string, input []byte) bool {
-	var subject string
+// inputSubjects returns the forms of a tool input that tool_input rules are tested
+// against: the raw JSON (patterns written against it keep working), the decoded string
+// values (so \u0072m cannot hide "rm"), and those values with shell quoting removed
+// (so shell quotes inside a word cannot either). This raises the bar against evasion but cannot make text
+// rules a boundary: a shell has endless ways to spell the same action.
+func inputSubjects(input []byte) []string {
+	subjects := []string{string(input)}
+	var v any
+	if json.Unmarshal(input, &v) != nil {
+		return subjects
+	}
+	var values []string
+	collectStrings(v, &values)
+	decoded := strings.Join(values, "\n")
+	if decoded == "" {
+		return subjects
+	}
+	subjects = append(subjects, decoded)
+	if unquoted := shellUnquoter.Replace(decoded); unquoted != decoded {
+		subjects = append(subjects, unquoted)
+	}
+	return subjects
+}
+
+var shellUnquoter = strings.NewReplacer(`'`, "", `"`, "", `\`, "")
+
+func collectStrings(v any, out *[]string) {
+	switch x := v.(type) {
+	case string:
+		*out = append(*out, x)
+	case []any:
+		for _, e := range x {
+			collectStrings(e, out)
+		}
+	case map[string]any:
+		for _, e := range x {
+			collectStrings(e, out)
+		}
+	}
+}
+
+func ruleMatches(r compiledRule, toolName string, inputs []string) bool {
+	subjects := inputs
 	switch r.MatchTarget {
 	case "tool_name":
-		subject = toolName
+		subjects = []string{toolName}
 	case "tool_input":
-		subject = string(input)
 	default:
 		return false
 	}
-	if r.MatchType == "regex" {
-		return r.re != nil && r.re.MatchString(subject)
+	for _, subject := range subjects {
+		if r.MatchType == "regex" {
+			if r.re != nil && r.re.MatchString(subject) {
+				return true
+			}
+		} else if strings.Contains(subject, r.Pattern) {
+			return true
+		}
 	}
-	return strings.Contains(subject, r.Pattern)
+	return false
 }
 
 func defaultMessage(action, name string) string {
@@ -686,4 +777,13 @@ func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
 	}
 	i.pending.resolve(pendingID, allowed)
 	return nil
+}
+
+// RecordAudit persists one final gating outcome. Best-effort: an audit write failure is
+// logged but never changes whether the tool call runs.
+func (i *Interceptor) RecordAudit(ctx context.Context, tool, action, reason, command string) {
+	taskID, _ := taskInfoFromCtx(ctx)
+	if err := i.db.AppendToolAudit(taskID, tool, action, reason, command); err != nil {
+		log.Printf("[audit] 写入失败: %v", err)
+	}
 }

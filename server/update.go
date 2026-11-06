@@ -225,6 +225,14 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 		"rolled_back": boot.RolledBack,
 	}
 
+	if !selfupdate.Enabled() {
+		out["comparable"] = false
+		out["has_update"] = false
+		out["reason"] = selfupdate.DisabledReason
+		writeJSON(w, 200, out)
+		return
+	}
+
 	// 顶栏提示走缓存（默认）；用户点"检查更新"时带 force=1 强制回源。
 	force := r.URL.Query().Get("force") != ""
 	client := selfupdate.NewClient(s.m.GlobalProxy())
@@ -269,6 +277,10 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 // 挂在请求上会被反代超时掐断。进度走 /api/update/stream。
 func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	current := BuildVersion
+	if !selfupdate.Enabled() {
+		writeErr(w, 400, selfupdate.DisabledReason)
+		return
+	}
 
 	// 走缓存：确保装上的就是用户在界面上看到并确认的那个版本。
 	client := selfupdate.NewClient(s.m.GlobalProxy())

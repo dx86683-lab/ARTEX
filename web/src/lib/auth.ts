@@ -19,8 +19,9 @@ export const auth = {
 
   setToken(token: string): void {
     localStorage.setItem(TOKEN_KEY, token);
-    // 同步写 cookie，供 Next.js middleware 服务端读取
-    document.cookie = `${TOKEN_KEY}=${encodeURIComponent(token)}; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Lax`;
+    // 这个 cookie 只是给 Next.js middleware 的「已登录」标记，不放真实 token：
+    // cookie 不按端口隔离，同主机其他端口的服务都读得到。后端 API 也不认 cookie。
+    document.cookie = `${TOKEN_KEY}=1; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Strict`;
   },
 
   clearToken(): void {

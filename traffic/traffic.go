@@ -164,7 +164,8 @@ type Traffic struct {
 	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
 	// reason; connections to them are tunneled transparently (fail-open) so the
 	// request still reaches the target — unrecorded — instead of being killed.
-	pass sync.Map // hostname(string) -> struct{}
+	pass   sync.Map                   // hostname(string) -> struct{}
+	egress atomic.Pointer[EgressGate] // optional; see SetEgressGate
 	// upstream is the global egress proxy every captured request is forwarded
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
@@ -222,10 +223,7 @@ func Open(dir, addr string) (*Traffic, error) {
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
-	p.SetShouldInterceptRule(func(req *http.Request) bool {
-		_, tunnel := t.pass.Load(hostOnly(req.Host))
-		return !tunnel
-	})
+	p.SetShouldInterceptRule(t.shouldIntercept)
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
 	return t, nil
@@ -298,6 +296,38 @@ func hostOnly(hostport string) string {
 		return h
 	}
 	return hostport
+}
+
+// shouldIntercept chooses MITM over a transparent tunnel. A blocked host is intercepted
+// even if marked for passthrough: a tunnel never reaches the addon that refuses it.
+func (t *Traffic) shouldIntercept(req *http.Request) bool {
+	host := hostOnly(req.Host)
+	if blocked, _ := t.egressDecision(host); blocked {
+		return true
+	}
+	_, tunnel := t.pass.Load(host)
+	return !tunnel
+}
+
+// EgressGate decides whether the proxy may reach host. It runs on every request, so an
+// implementation that consults a database must cache.
+type EgressGate func(host string) (blocked bool, reason string)
+
+// SetEgressGate installs the gate. Passing nil removes it.
+func (t *Traffic) SetEgressGate(g EgressGate) {
+	if g == nil {
+		t.egress.Store(nil)
+		return
+	}
+	t.egress.Store(&g)
+}
+
+func (t *Traffic) egressDecision(host string) (bool, string) {
+	g := t.egress.Load()
+	if g == nil {
+		return false, ""
+	}
+	return (*g)(host)
 }
 
 // ProxyAddr returns the address workers should set as HTTP(S)_PROXY. A bare
@@ -387,6 +417,23 @@ func (t *Traffic) DB() *sql.DB { return t.db }
 type sink struct {
 	mproxy.BaseAddon
 	t *Traffic
+}
+
+// Requestheaders refuses traffic to hosts the egress gate rejects. Setting f.Response
+// makes the proxy answer without contacting the target.
+func (s *sink) Requestheaders(f *mproxy.Flow) {
+	if f.Request == nil || f.Request.URL == nil {
+		return
+	}
+	blocked, reason := s.t.egressDecision(hostOnly(f.Request.URL.Host))
+	if !blocked {
+		return
+	}
+	f.Response = &mproxy.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Content-Type": {"text/plain; charset=utf-8"}},
+		Body:       []byte("【ARTEX 平台管控·非目标防御】出口代理已拒绝此请求。原因：" + reason + "\n"),
+	}
 }
 
 func (s *sink) Response(f *mproxy.Flow) {
