@@ -1,8 +1,8 @@
 // Package guard implements the safety boundary layer (docs §11): an audit log,
 // user-configured intercept-rule evaluation, and Observer/G5 failure attribution.
 // Every tool call passes through the PreToolUse hook before executing.
-// (The RoE authorization-scope mechanism was removed; a replacement may be added
-// later.) Destructive/exfil gating is no longer hard-coded here — it lives in the
+// Scope is checked here on a best-effort basis (intercept.CheckTargets reads targets out
+// of the command text); only network egress control can enforce it. Destructive/exfil gating is no longer hard-coded here — it lives in the
 // DB intercept rules (seeded as ordinary [内置] rules, so users can disable or
 // delete them), evaluated via applyIntercept.
 package guard
@@ -74,8 +74,15 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
-	g.record(ev.ToolName, "allow", "", cmd)
-	return g.applyIntercept(ctx, ev)
+	res := g.applyIntercept(ctx, ev)
+	// Recorded after the decision so the log holds exactly one entry per call, stating
+	// what actually happened (an "ask" may have waited minutes for a human).
+	action, reason := "allow", ""
+	if res.Decision == "block" {
+		action, reason = "block", res.Message
+	}
+	g.record(ctx, ev.ToolName, action, reason, cmd)
+	return res
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.
@@ -84,11 +91,16 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	if g.interceptor == nil {
 		return hook.Result{}
 	}
-	if !g.interceptor.IsToolEnabled(ev.ToolName) {
-		return hook.Result{}
-	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	// Target checks come first and ignore the tool list and allow rules: scope is not
+	// something an operator's convenience rule for a tool should be able to widen.
+	dec, matched := g.interceptor.CheckTargets(ctx, ev.ToolName, ev.Input)
+	if !matched {
+		if !g.interceptor.IsToolEnabled(ev.ToolName) {
+			return hook.Result{}
+		}
+		dec, matched = g.interceptor.Match(ev.ToolName, ev.Input)
+	}
 	if !matched {
 		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
 		// or unwired, keep current behavior and allow.
@@ -102,7 +114,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	case "deny":
 		// 观测:deny 命中不阻塞审批,直接记一条 denied（历史/任务拦截页可见）。
 		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "denied")
-		return g.block(ev.ToolName, systemBlockMessage(dec.Message), "")
+		return g.block(systemBlockMessage(dec.Message))
 	case "allow":
 		// Record explicit rule and model approvals so review details remain auditable.
 		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "allowed")
@@ -112,11 +124,11 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		// immediately without creating a pending record — avoids orphaned DB entries
 		// and makes execOne complete fast, reducing the race against drainSynthetic.
 		if ctx.Err() != nil {
-			return g.block(ev.ToolName, systemBlockMessage("工作已取消，平台安全管控阻止执行"), "")
+			return g.block(systemBlockMessage("工作已取消，平台安全管控阻止执行"))
 		}
 		convID := intercept.ConvIDFromContext(ctx)
 		if !g.interceptor.HandleAsk(ctx, convID, dec, ev.ToolName, ev.Input) {
-			return g.block(ev.ToolName, systemBlockMessage("人工审批未通过（用户拒绝或审批超时）"), "")
+			return g.block(systemBlockMessage("人工审批未通过（用户拒绝或审批超时）"))
 		}
 		return hook.Result{}
 	}
@@ -173,17 +185,19 @@ func (g *Guard) Attributions() map[string]int {
 	return out
 }
 
-func (g *Guard) block(tool, reason, cmd string) hook.Result {
-	g.record(tool, "block", reason, cmd)
+func (g *Guard) block(reason string) hook.Result {
 	return hook.Result{Decision: "block", Message: reason}
 }
 
-func (g *Guard) record(tool, action, reason, cmd string) {
+func (g *Guard) record(ctx context.Context, tool, action, reason, cmd string) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.audit = append(g.audit, AuditEntry{TS: time.Now().Unix(), Tool: tool, Action: action, Reason: reason, Command: cmd})
 	if len(g.audit) > 2000 {
 		g.audit = g.audit[len(g.audit)-2000:]
+	}
+	g.mu.Unlock()
+	if g.interceptor != nil {
+		g.interceptor.RecordAudit(ctx, tool, action, reason, cmd)
 	}
 }
 

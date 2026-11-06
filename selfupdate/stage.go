@@ -3,8 +3,11 @@ package selfupdate
 import (
 	"archive/zip"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +20,11 @@ import (
 
 // sumsAsset 是 release.yml 生成的校验和清单，覆盖 Release 里全部 zip。
 const sumsAsset = "SHA256SUMS"
+
+// sumsSigAsset 是 SHA256SUMS 的 Ed25519 签名（base64）。校验和和二进制来自同一个
+// Release，单靠校验和只能发现传输损坏，发布账号被盗时攻击者可以把两者一起换掉；
+// 私钥不在 GitHub 上，签名才能挡住这种情况。
+const sumsSigAsset = "SHA256SUMS.sig"
 
 // maxBinarySize 限制解压出来的二进制体积，防止畸形 zip 把磁盘写满。
 const maxBinarySize = 512 << 20 // 512 MiB
@@ -143,11 +151,52 @@ func fetchSums(ctx context.Context, c *http.Client, rel *Release) (map[string]st
 	if err != nil {
 		return nil, fmt.Errorf("读取 %s: %w", sumsAsset, err)
 	}
+	sigAsset, ok := rel.FindAsset(sumsSigAsset)
+	if !ok {
+		return nil, fmt.Errorf("该 Release 没有 %s，无法确认发布者，拒绝升级", sumsSigAsset)
+	}
+	sigBody, err := get(ctx, c, sigAsset.URL)
+	if err != nil {
+		return nil, fmt.Errorf("下载 %s: %w", sumsSigAsset, err)
+	}
+	defer sigBody.Close()
+	sig, err := io.ReadAll(io.LimitReader(sigBody, 4<<10))
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s: %w", sumsSigAsset, err)
+	}
+	if err := verifySums(raw, sig); err != nil {
+		return nil, err
+	}
+
 	out := parseSums(string(raw))
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%s 内容为空或格式无法识别", sumsAsset)
 	}
 	return out, nil
+}
+
+func releasePublicKey() (ed25519.PublicKey, error) {
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(PublicKey))
+	if err != nil || len(key) != ed25519.PublicKeySize {
+		return nil, errors.New("发布签名公钥无效或未配置")
+	}
+	return ed25519.PublicKey(key), nil
+}
+
+// verifySums 校验 SHA256SUMS 的签名。sig 是 base64 文本。
+func verifySums(sums, sig []byte) error {
+	key, err := releasePublicKey()
+	if err != nil {
+		return err
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sig)))
+	if err != nil {
+		return fmt.Errorf("%s 格式错误: %w", sumsSigAsset, err)
+	}
+	if !ed25519.Verify(key, sums, raw) {
+		return fmt.Errorf("%s 签名校验失败（发布内容被篡改或签名密钥不匹配），拒绝升级", sumsAsset)
+	}
+	return nil
 }
 
 // parseSums 解析 sha256sum 风格的清单，返回 文件名 → 十六进制摘要。

@@ -46,6 +46,14 @@ type Server struct {
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 
+	initToken string       // required by /api/auth/init; see prepareInitToken
+	authLimit loginLimiter // per-client backoff on password checks
+
+	pwvMu     sync.Mutex // guards the cached password fingerprint (see currentPWV)
+	pwvValue  string
+	pwvLoaded bool
+	pwvAt     time.Time
+
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
@@ -151,6 +159,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.prepareInitToken()
 	s.initSideQuestions()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
@@ -656,6 +665,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
+	mux.HandleFunc("POST /api/sse-ticket", s.sseTicket)
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/stats", s.stats)
@@ -935,11 +945,11 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(mux))
+	api := cors(limitRequestBody(s.requireAuth(mux)))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
-	return root
+	return securityHeaders(root)
 }
 
 // --- handlers ---
@@ -3867,7 +3877,15 @@ func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []any{})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"entries": t.Guard.Audit(), "attributions": t.Guard.Attributions()})
+	// The database copy survives restarts; the in-memory ring is the fallback when it
+	// cannot be read, so a database failure does not hide the recent calls.
+	var entries any = t.Guard.Audit()
+	if s.m.pg != nil {
+		if stored, err := s.m.pg.ListToolAudit(t.ID, 2000); err == nil {
+			entries = stored
+		}
+	}
+	writeJSON(w, 200, map[string]any{"entries": entries, "attributions": t.Guard.Attributions()})
 }
 
 // gc is a no-op stub (GC not yet implemented in the new asset store).

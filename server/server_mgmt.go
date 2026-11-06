@@ -857,6 +857,9 @@ func (s *Server) pgListMCP(w http.ResponseWriter, r *http.Request) {
 	if ms == nil {
 		ms = []*db.MCPServer{}
 	}
+	for _, m := range ms {
+		m.Env = maskMCPEnv(m.Env)
+	}
 	writeJSON(w, 200, map[string]any{"servers": ms})
 }
 
@@ -871,6 +874,7 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isNew := m.ID == 0
+	m.Env = s.restoreMCPEnv(m.ID, m.Env)
 	id, err := pg.SaveMCP(&m)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2229,4 +2233,50 @@ func templateFields(t *template.Template) []string {
 		walk(t.Tree.Root)
 	}
 	return out
+}
+
+// mcpEnvMask stands in for stored MCP env values in API responses. For remote servers
+// env holds request headers such as X-API-Key, so the values are credentials.
+const mcpEnvMask = "********"
+
+// maskMCPEnv keeps the keys so the UI can show what is configured, and leaves empty
+// values empty so "not set yet" stays distinguishable.
+func maskMCPEnv(raw json.RawMessage) json.RawMessage {
+	env := decodeStrMap(raw)
+	for k, v := range env {
+		if v != "" {
+			env[k] = mcpEnvMask
+		}
+	}
+	return encodeJSON(env)
+}
+
+// restoreMCPEnv swaps the mask back for the stored value, so saving a form that was
+// populated from a masked response does not overwrite real credentials with asterisks.
+func (s *Server) restoreMCPEnv(id int64, raw json.RawMessage) json.RawMessage {
+	if id == 0 || len(raw) == 0 {
+		return raw
+	}
+	env := decodeStrMap(raw)
+	masked := false
+	for _, v := range env {
+		masked = masked || v == mcpEnvMask
+	}
+	if !masked {
+		return raw
+	}
+	var stored map[string]string
+	if all, err := s.m.pg.ListMCP(); err == nil {
+		for _, m := range all {
+			if m.ID == id {
+				stored = decodeStrMap(m.Env)
+			}
+		}
+	}
+	for k, v := range env {
+		if v == mcpEnvMask {
+			env[k] = stored[k]
+		}
+	}
+	return encodeJSON(env)
 }

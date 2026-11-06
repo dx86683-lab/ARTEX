@@ -201,6 +201,46 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 ---
 
+## 安全
+
+### 部署
+
+- **首次设置密码**需要初始化令牌：在 `.env` 设置 `ARTEX_INIT_TOKEN`，或留空后从启动日志获取（`docker compose logs artex | grep 初始化令牌`）。
+- **监听地址**：`docker-compose.yml` 默认只绑定 `127.0.0.1`。远程访问时设置 `ARTEX_BIND=0.0.0.0`，并放在 TLS 反向代理后面。
+- **登录限流**按连接来源 IP 计算，不信任 `X-Forwarded-For`。在反向代理后面时，所有客户端共用一个额度，连续输错可能让其他人也被锁定（最长 15 分钟）。
+
+### Agent 的隔离边界
+
+Agent 通过 Bash 执行命令，与 ARTEX 进程以**同一用户、同一文件系统**运行，目前没有沙箱。敏感环境变量已移出子进程环境，但 Agent 仍可读取 `jwt.key`、`config.json` 和 `/proc/<pid>/environ`。目标页面中的提示注入有可能借此接管平台。
+
+- 只在隔离环境中运行，不要和其他服务共用主机。
+- 测试前为模型和数据库使用专用凭据，结束后轮换。
+- 拦截规则是防误操作的手段，不是安全边界：文本规则可以被改写绕过。
+
+### 授权范围
+
+资产拦截规则在以下位置生效：
+
+| 位置 | 依据 | 局限 |
+|---|---|---|
+| 工具调用（Bash、WebFetch、MCP、自定义工具） | 全局和任务级规则 | 从命令文本提取目标，运行时拼接的主机名看不到 |
+| 录制代理 | 全局规则 | 不区分任务；清除 `HTTP_PROXY` 的命令可以绕过 |
+| 写入资产、下发意图、扩大范围 | 全局和任务级规则 | 只管理数据，不影响实际流量 |
+
+要严格限定范围，需要在网络层只放行代理出口（防火墙或容器网络策略）。
+
+### 一键更新
+
+默认关闭。启用时生成签名密钥（私钥不要放在 GitHub 上），在构建时注入发布源和公钥，并为每个 Release 上传签名：
+
+```bash
+go run ./cmd/artex-sign keygen release.key        # 打印公钥
+ARTEX_UPDATE_REPO=<owner>/<repo> ARTEX_UPDATE_PUBKEY=<公钥> ./build.sh
+go run ./cmd/artex-sign sign release.key SHA256SUMS   # 生成 SHA256SUMS.sig，与 SHA256SUMS 一同上传
+```
+
+---
+
 ## 配置
 
 **数据库**（`config.json`，或用环境变量 `ARTEX_PG_DSN` 覆盖）：

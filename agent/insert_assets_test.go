@@ -448,3 +448,25 @@ func TestInsertAssetsRejectsHostnameIPPerItem(t *testing.T) {
 		t.Fatalf("rejected hostname still stored in assets.ip (%d rows)", stored)
 	}
 }
+
+func TestScopeEntryBlockedByRules(t *testing.T) {
+	rules := []db.AssetInterceptRule{
+		{Enabled: true, Kind: "fuzzy_domain", Pattern: ".gov", Note: "gov"},
+		{Enabled: true, Kind: "cidr", Pattern: "10.0.0.0/8"},
+	}
+	for _, tc := range []struct {
+		kind, value string
+		want        bool
+	}{
+		{"root_domain", "agency.gov", true},
+		{"subdomain", "a.example.com", false},
+		{"ip", "10.1.2.3", true},
+		{"cidr", "10.1.0.0/16", true},
+		{"cidr", "192.168.0.0/16", false},
+		{"company", "agency.gov", false},
+	} {
+		if _, got := scopeEntryBlocked(rules, tc.kind, tc.value); got != tc.want {
+			t.Errorf("%s %s: blocked=%v want %v", tc.kind, tc.value, got, tc.want)
+		}
+	}
+}

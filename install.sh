@@ -48,7 +48,8 @@ install_docker(){
   info "拉取镜像并启动…"
   docker compose pull || true
   docker compose up -d
-  ok "启动完成 → http://localhost:8787"
+  ok "启动完成 → http://localhost:8787（默认只监听本机，远程访问见 README「安全」）"
+  info "首次设置密码需要初始化令牌：docker compose logs artex | grep 初始化令牌"
   info "查看日志：docker compose logs -f artex"
 }
 

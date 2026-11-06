@@ -162,7 +162,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+// EventSource can't set headers, so a ticket goes in ?token=. Tickets open SSE routes
+// only and expire within a day, because URLs end up in reverse-proxy logs.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# ARTEX 渗透测试报告 — Acme Corp
@@ -192,9 +193,18 @@ export function sseUrl(path: string): string {
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
-  const token = getToken();
   const sep = path.includes("?") ? "&" : "?";
-  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+  return sseTicket ? `${base}${path}${sep}token=${encodeURIComponent(sseTicket)}` : `${base}${path}`;
+}
+
+let sseTicket: string | null = null;
+
+// refreshSseTicket must have completed before sseUrl is used; the main layout awaits it
+// before rendering anything that opens a stream, and renews it while the page is open.
+export async function refreshSseTicket(): Promise<void> {
+  if (MOCK) return;
+  const { ticket } = await http<{ ticket: string }>("/sse-ticket", { method: "POST" });
+  sseTicket = ticket;
 }
 
 const get = <T>(p: string) => http<T>(p);
@@ -237,11 +247,12 @@ export const api = {
   health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
 
   // ---- auth ----
-  authStatus: () => get<{ initialized: boolean }>("/auth/status"),
+  authStatus: () => get<{ initialized: boolean; init_token_required?: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
-  initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  initPassword: (password: string, initToken: string) =>
+    post<{ token: string }>("/auth/init", { password, init_token: initToken }),
   changePassword: (oldPassword: string, newPassword: string) =>
-    post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+    post<{ ok: boolean; token?: string }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
   // ---- tasks ----
   tasks: () =>

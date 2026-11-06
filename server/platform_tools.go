@@ -318,7 +318,9 @@ func (s *Server) toolUpdateMCP() actool.CoreTool {
 			if a.ID == 0 {
 				return actool.Errorf("id 必填"), nil
 			}
-			if _, err := s.m.pg.SaveMCP(a.toDB()); err != nil {
+			m := a.toDB()
+			m.Env = s.restoreMCPEnv(m.ID, m.Env)
+			if _, err := s.m.pg.SaveMCP(m); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			return actool.Text(fmt.Sprintf("mcp updated: id=%d", a.ID)), nil

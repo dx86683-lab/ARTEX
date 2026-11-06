@@ -51,6 +51,9 @@ func main() {
 }
 
 func run() int {
+	// Must precede anything that spawns a child process.
+	config.SealSecrets()
+
 	var (
 		addr    = flag.String("addr", ":8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
@@ -117,6 +120,9 @@ func run() int {
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// No global ReadTimeout or WriteTimeout: uploads and SSE legitimately run for a
+		// long time. limitRequestBody bounds the unauthenticated routes instead.
+		IdleTimeout: 2 * time.Minute,
 	}
 
 	go func() {

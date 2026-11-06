@@ -227,15 +227,20 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			var results []result
 			var errs []errEntry
 
-			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
+			// 资产闸门规则一次性载入；读取失败则拒绝插入，读不到规则不等于没有规则。
 			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
-			blockRules, _ := t.as.ListAssetInterceptRules()
+			blockRules, err := t.as.ListAssetInterceptRules()
+			if err != nil {
+				return actool.Errorf("资产拦截规则读取失败，已拒绝插入：" + err.Error()), nil
+			}
 			var allowRules []db.AssetInterceptRule
 			if t.taskID > 0 {
-				if tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID); err == nil {
-					blockRules = append(blockRules, tb...)
-					allowRules = ta
+				tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID)
+				if err != nil {
+					return actool.Errorf("任务拦截规则读取失败，已拒绝插入：" + err.Error()), nil
 				}
+				blockRules = append(blockRules, tb...)
+				allowRules = ta
 			}
 
 			for i, item := range a.Assets {
@@ -465,7 +470,23 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			}
 			var added []map[string]any
 			errs := map[string]string{}
+			// 范围由 Agent 提出，所以不能越过拦截规则：否则目标页面里一句提示注入就能
+			// 让 Planner 把黑名单目标登记进范围。读不到规则时同样拒绝。
+			blockRules, err := t.as.ListAssetInterceptRules()
+			if err != nil {
+				return actool.Errorf("资产拦截规则读取失败，已拒绝扩大范围：" + err.Error()), nil
+			}
+			taskBlock, _, err := t.as.TaskInterceptRulesSplit(t.taskID)
+			if err != nil {
+				return actool.Errorf("任务拦截规则读取失败，已拒绝扩大范围：" + err.Error()), nil
+			}
+			blockRules = append(blockRules, taskBlock...)
+
 			for i, e := range items {
+				if reason, blocked := scopeEntryBlocked(blockRules, strings.TrimSpace(e.Kind), e.Value); blocked {
+					errs[fmt.Sprintf("%d", i)] = reason
+					continue
+				}
 				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
@@ -696,4 +717,24 @@ func (t *ToolSet) AllDomainTools() []actool.CoreTool {
 		}
 	}
 	return out
+}
+
+// scopeEntryBlocked checks a proposed scope entry against block rules. Kinds that do not
+// name a host or address (company, icp, keyword) have nothing to match here.
+func scopeEntryBlocked(rules []db.AssetInterceptRule, kind, value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	var domains, ips []string
+	switch kind {
+	case "root_domain", "subdomain":
+		domains = []string{value}
+	case "ip", "cidr":
+		ip, _, _ := strings.Cut(value, "/")
+		ips = []string{ip}
+	default:
+		return "", false
+	}
+	if rule, _, hit := db.MatchAssetInterceptRules(rules, domains, ips, nil); hit {
+		return rule.Reason() + "，已禁止加入范围", true
+	}
+	return "", false
 }

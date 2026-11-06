@@ -219,7 +219,7 @@ build_target() {
   go build \
     -tags embedui \
     -trimpath \
-    -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
+    -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION} -X github.com/Autumn-27/artex/selfupdate.Repo=${ARTEX_UPDATE_REPO:-} -X github.com/Autumn-27/artex/selfupdate.PublicKey=${ARTEX_UPDATE_PUBKEY:-}" \
     -o "$output" \
     ./cmd/artex
 

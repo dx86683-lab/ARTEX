@@ -10,12 +10,30 @@ import (
 	"time"
 )
 
-// Repo 是发布源。写死而不是做成配置项：更新源可配等于给任何能改配置的人一条
-// 远程代码执行通道，对一个渗透测试平台来说这个口子开不得。
-const Repo = "Autumn-27/artex"
+// Repo 是发布源，PublicKey 是发布签名公钥（base64 编码的 Ed25519 公钥）。两者都只能
+// 在编译时用 -ldflags -X 注入，不做成运行时配置：更新源可配等于给任何能改配置的人
+// 一条远程代码执行通道，对一个渗透测试平台来说这个口子开不得。
+//
+// 默认都为空，此时一键更新关闭（见 Enabled）。自行维护的版本如果沿用上游地址，点一下
+// 更新就会被上游二进制覆盖，所以必须由发布方显式声明。
+var (
+	Repo      = ""
+	PublicKey = ""
+)
 
-// latestURL 是 GitHub 的"最新正式版"接口。它会自动跳过 prerelease 和 draft。
-const latestURL = "https://api.github.com/repos/" + Repo + "/releases/latest"
+// Enabled 报告本构建是否配置了发布源和可用的签名公钥。
+func Enabled() bool {
+	_, err := releasePublicKey()
+	return Repo != "" && err == nil
+}
+
+// DisabledReason 是一键更新关闭时展示给用户的说明。
+const DisabledReason = "此构建未配置发布源和签名公钥，一键更新已关闭，请手动升级"
+
+// latestURL 返回 GitHub 的"最新正式版"接口。它会自动跳过 prerelease 和 draft。
+func latestURL() string {
+	return "https://api.github.com/repos/" + Repo + "/releases/latest"
+}
 
 // allowedHosts 限定升级链路能访问的域名。配合下面的 checkRedirect，
 // 任何一跳被重定向到名单外的主机都会直接失败——这是防止 DNS 污染 / 中间人
@@ -86,7 +104,7 @@ func checkURL(u *url.URL) error {
 
 // FetchLatest 查询最新正式版。
 func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL(), nil)
 	if err != nil {
 		return nil, err
 	}

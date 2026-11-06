@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -405,14 +407,57 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 	}
 	pj, _ := json.Marshal(params)
 	c.Stdin = bytes.NewReader(pj) // 参数 JSON 走 stdin
-	out, err := c.CombinedOutput()
-	body := string(out)
-	if runCtx.Err() == context.DeadlineExceeded {
+	// Run in its own process group so a timeout also reaches children. WaitDelay is
+	// the backstop: without it Wait blocks for as long as any descendant holds the
+	// output pipe open, however long ago the timeout fired.
+	killProcessGroupOnCancel(c)
+	c.WaitDelay = toolWaitDelay
+	out := &cappedBuffer{max: maxToolOutput}
+	c.Stdout, c.Stderr = out, out
+	err = c.Run()
+	body := out.String()
+	switch {
+	case runCtx.Err() == context.DeadlineExceeded:
 		body += "\n... [超时终止] ..."
-	} else if err != nil {
+	case errors.Is(err, exec.ErrWaitDelay):
+		body += "\n[脚本已退出，但有后台子进程仍占用输出，已停止等待]"
+	case err != nil:
 		body += "\n[exit: " + err.Error() + "]"
 	}
 	return body, nil
+}
+
+const (
+	maxToolOutput = 10 << 20
+	toolWaitDelay = 2 * time.Second
+)
+
+// cappedBuffer keeps the first max bytes and discards the rest. Write always reports
+// success so a chatty child is not killed by EPIPE. exec.Cmd serialises writes when
+// Stdout and Stderr are the same writer, so no lock is needed.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if room := b.max - b.buf.Len(); room < len(p) {
+		b.truncated = true
+		if room > 0 {
+			b.buf.Write(p[:room])
+		}
+		return len(p), nil
+	}
+	b.buf.Write(p)
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string {
+	if b.truncated {
+		return b.buf.String() + "\n... [输出过长，已截断] ..."
+	}
+	return b.buf.String()
 }
 
 // ---------- http:原生请求 + 代理 ----------
@@ -424,7 +469,7 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	if method == "" {
 		method = "GET"
 	}
-	rawURL := renderTemplate(spec.URL, params, identity)
+	rawURL := renderURLTemplate(spec.URL, params)
 	if strings.TrimSpace(rawURL) == "" {
 		return actool.Errorf("http url 为空"), nil
 	}
@@ -493,13 +538,58 @@ func identity(s string) string { return s }
 // shellQuote single-quotes a value for safe shell interpolation.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+var templateVar = regexp.MustCompile(`\{([^{}]+)\}`)
+
 // renderTemplate replaces {name} placeholders with each param's rendered value.
+//
+// It scans the template exactly once. Substituting params one after another would
+// re-expand a placeholder smuggled inside an earlier value, and that second expansion
+// lands inside the first value's shell quotes and closes them.
 func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
-	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
+	return templateVar.ReplaceAllStringFunc(tmpl, func(m string) string {
+		v, ok := params[m[1:len(m)-1]]
+		if !ok {
+			return m
+		}
+		return quote(valToStr(v))
+	})
+}
+
+// renderURLTemplate escapes each value for where it lands in the URL, so a param cannot
+// add query fields or change the path. A leading placeholder stays raw because it is
+// the base of the URL (for example {target}/login) and must be able to carry a scheme.
+func renderURLTemplate(tmpl string, params map[string]any) string {
+	query := strings.IndexByte(tmpl, '?')
+	var out strings.Builder
+	last := 0
+	for _, loc := range templateVar.FindAllStringSubmatchIndex(tmpl, -1) {
+		v, ok := params[tmpl[loc[2]:loc[3]]]
+		if !ok {
+			continue
+		}
+		out.WriteString(tmpl[last:loc[0]])
+		val := valToStr(v)
+		switch {
+		case loc[0] == 0:
+			out.WriteString(val)
+		case query >= 0 && loc[0] > query:
+			out.WriteString(url.QueryEscape(val))
+		default:
+			out.WriteString(escapeURLPath(val))
+		}
+		last = loc[1]
 	}
-	return out
+	out.WriteString(tmpl[last:])
+	return out.String()
+}
+
+// escapeURLPath escapes each segment and keeps "/" so {path} can span segments.
+func escapeURLPath(s string) string {
+	parts := strings.Split(s, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.

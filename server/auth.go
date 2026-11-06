@@ -1,7 +1,11 @@
 package server
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
@@ -12,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Autumn-27/artex/config"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -20,6 +25,10 @@ const (
 	jwtKeyFilename = "jwt.key"
 	authPassKey    = "auth.password_hash"
 	jwtTTL         = 7 * 24 * time.Hour
+	sseAudience    = "sse"
+	sseTicketTTL   = 24 * time.Hour
+	pwvCacheTTL    = 10 * time.Second
+	initTokenEnv   = "ARTEX_INIT_TOKEN"
 	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	// 下限与 setup 页的前端校验一致——校验只放在前端等于没放，直接打 API 就能
@@ -83,40 +92,134 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
-func signJWT(key []byte) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ARTEX",
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
+// authClaims carries the password fingerprint that ties a session to the password
+// it was issued under, so changing the password revokes every older token.
+type authClaims struct {
+	jwt.RegisteredClaims
+	PWV string `json:"pwv,omitempty"`
+}
+
+// passwordFingerprint derives the claim from the stored hash. It is an HMAC rather
+// than the hash itself because JWT payloads are readable by whoever holds the token.
+func passwordFingerprint(key []byte, hash string) string {
+	if hash == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(hash))
+	return hex.EncodeToString(mac.Sum(nil))[:16]
+}
+
+func signClaims(key []byte, pwv string, ttl time.Duration, audience ...string) (string, error) {
+	now := time.Now()
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, authClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "ARTEX",
+			Audience:  audience,
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			IssuedAt:  jwt.NewNumericDate(now),
+		},
+		PWV: pwv,
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+// signJWT issues a session token that is only valid while no password is set.
+// Handlers use signSession; this form remains for callers with no password context.
+func signJWT(key []byte) (string, error) { return signClaims(key, "", jwtTTL) }
+
+// signSession issues a 7-day session token bound to the current password.
+func (s *Server) signSession(passwordHash string) (string, error) {
+	return signClaims(s.jwtKey, passwordFingerprint(s.jwtKey, passwordHash), jwtTTL)
+}
+
+// parseToken validates signature, algorithm and expiry.
+func parseToken(tokenStr string, key []byte) (*authClaims, bool) {
+	claims := &authClaims{}
+	t, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
-	return err == nil && t.Valid
+	if err != nil || !t.Valid {
+		return nil, false
+	}
+	return claims, true
 }
 
-// extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
-func extractToken(r *http.Request) string {
+func (c *authClaims) isSSETicket() bool {
+	for _, aud := range c.Audience {
+		if aud == sseAudience {
+			return true
+		}
+	}
+	return false
+}
+
+// currentPWV returns the fingerprint of the stored password, cached briefly because
+// it is checked on every API request. reset-password.sh edits the database directly,
+// so the cache must expire rather than rely on an explicit invalidation. A transient
+// read failure keeps the last known value: answering 401 would log the operator out.
+func (s *Server) currentPWV() (string, error) {
+	s.pwvMu.Lock()
+	defer s.pwvMu.Unlock()
+	if s.pwvLoaded && time.Since(s.pwvAt) < pwvCacheTTL {
+		return s.pwvValue, nil
+	}
+	if s.m == nil || s.m.pg == nil {
+		return "", nil
+	}
+	hash, _, err := s.m.pg.GetSetting(authPassKey)
+	if err != nil {
+		if s.pwvLoaded {
+			return s.pwvValue, nil
+		}
+		return "", err
+	}
+	s.pwvValue, s.pwvLoaded, s.pwvAt = passwordFingerprint(s.jwtKey, hash), true, time.Now()
+	return s.pwvValue, nil
+}
+
+func (s *Server) invalidatePWV() {
+	s.pwvMu.Lock()
+	s.pwvLoaded = false
+	s.pwvMu.Unlock()
+}
+
+// authenticate checks a bearer session token against the current password.
+func (s *Server) authenticate(tok string) (ok bool, unavailable bool) {
+	claims, valid := parseToken(tok, s.jwtKey)
+	if !valid || claims.isSSETicket() {
+		return false, false
+	}
+	return s.claimsCurrent(claims)
+}
+
+func (s *Server) claimsCurrent(claims *authClaims) (ok bool, unavailable bool) {
+	pwv, err := s.currentPWV()
+	if err != nil {
+		return false, true
+	}
+	return claims.PWV == pwv, false
+}
+
+func bearerToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
-	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
-		return c.Value
-	}
-	return r.URL.Query().Get("token")
+	return ""
+}
+
+// isSSEPath lists the only routes that accept a query-string ticket: EventSource
+// cannot set headers, and everything else must not put credentials in a URL.
+func isSSEPath(r *http.Request) bool {
+	return r.Method == http.MethodGet &&
+		(strings.HasSuffix(r.URL.Path, "/stream") || strings.HasSuffix(r.URL.Path, "/events"))
 }
 
 // requireAuth wraps h with JWT validation.
-// /api/auth/* and /api/health are exempt.
+// /api/auth/* and /api/health are exempt. Cookies are deliberately not accepted, which
+// is what keeps the API out of reach of cross-site requests despite the open CORS.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
@@ -124,17 +227,69 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			h.ServeHTTP(w, r)
 			return
 		}
-		tok := extractToken(r)
-		if tok == "" {
+		var ok, unavailable bool
+		if tok := bearerToken(r); tok != "" {
+			ok, unavailable = s.authenticate(tok)
+		} else if ticket := r.URL.Query().Get("token"); ticket != "" && isSSEPath(r) {
+			if claims, valid := parseToken(ticket, s.jwtKey); valid && claims.isSSETicket() {
+				ok, unavailable = s.claimsCurrent(claims)
+			}
+		} else {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if unavailable {
+			writeErr(w, 503, errDataSourceUnavailable)
+			return
+		}
+		if !ok {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// POST /api/sse-ticket — exchanges the session for a read-scoped streaming ticket.
+// Tickets go into URLs and therefore into reverse-proxy logs, so they only open SSE
+// routes and expire within a day; they cannot call any other endpoint.
+func (s *Server) sseTicket(w http.ResponseWriter, r *http.Request) {
+	pwv, err := s.currentPWV()
+	if err != nil {
+		writeErr(w, 503, errDataSourceUnavailable)
+		return
+	}
+	ticket, err := signClaims(s.jwtKey, pwv, sseTicketTTL, sseAudience)
+	if err != nil {
+		writeErr(w, 500, "ticket 生成失败")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ticket": ticket, "expires_in": int(sseTicketTTL.Seconds())})
+}
+
+// prepareInitToken decides who may claim an uninitialised install. Without it the
+// first visitor to reach the port becomes administrator, and an administrator can run
+// arbitrary commands. The generated value only reaches the server log.
+func (s *Server) prepareInitToken() {
+	if tok := strings.TrimSpace(config.Secret(initTokenEnv)); tok != "" {
+		s.initToken = tok
+		return
+	}
+	if s.m != nil && s.m.pg != nil {
+		if hash, _, err := s.m.pg.GetSetting(authPassKey); err == nil && hash != "" {
+			return
+		}
+	}
+	buf := make([]byte, 24)
+	for i := range buf {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(keyChars))))
+		if err != nil {
+			log.Fatalf("[auth] 生成初始化令牌失败: %v", err)
+		}
+		buf[i] = keyChars[n.Int64()]
+	}
+	s.initToken = string(buf)
+	log.Printf("[auth] 管理员密码尚未设置。初始化令牌（在 /setup 页面填写）: %s", s.initToken)
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.
@@ -151,7 +306,7 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
+	writeJSON(w, 200, map[string]any{"initialized": hash != "", "init_token_required": hash == ""})
 }
 
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
@@ -169,10 +324,25 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	var req struct {
-		Password string `json:"password"`
+	ip := clientIP(r)
+	if wait, limited := s.authLimit.check(ip); limited {
+		writeRateLimited(w, wait)
+		return
 	}
-	if err := decode(r, &req); err != nil || req.Password == "" {
+	var req struct {
+		Password  string `json:"password"`
+		InitToken string `json:"init_token"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	if s.initToken == "" || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(req.InitToken)), []byte(s.initToken)) != 1 {
+		s.authLimit.fail(ip)
+		writeErr(w, 403, "初始化令牌错误（见服务端启动日志）")
+		return
+	}
+	if req.Password == "" {
 		writeErr(w, 400, "密码不能为空")
 		return
 	}
@@ -197,7 +367,9 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	s.authLimit.success(ip)
+	s.invalidatePWV()
+	tok, err := s.signSession(string(hash))
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
@@ -213,8 +385,18 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	ok, unavailable := s.authenticate(bearerToken(r))
+	if unavailable {
+		writeErr(w, 503, errDataSourceUnavailable)
+		return
+	}
+	if !ok {
 		writeErr(w, 401, "未授权")
+		return
+	}
+	ip := clientIP(r)
+	if wait, limited := s.authLimit.check(ip); limited {
+		writeRateLimited(w, wait)
 		return
 	}
 	var req struct {
@@ -242,10 +424,13 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码未初始化，请先设置密码")
 		return
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.OldPassword)); err != nil {
-		writeErr(w, 401, "当前密码错误")
+	if err := s.comparePassword(r, hash, req.OldPassword); err != nil {
+		s.authLimit.fail(ip)
+		// 不能回 401：前端的 http() 见到 401 就清掉登录态跳回登录页。
+		writeErr(w, 403, "当前密码错误")
 		return
 	}
+	s.authLimit.success(ip)
 	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		writeErr(w, 500, "密码加密失败")
@@ -255,13 +440,25 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	s.invalidatePWV()
+	// 旧 token 随改密一起失效，所以把新 token 交给发起改密的这个会话。
+	tok, err := s.signSession(string(newHash))
+	if err != nil {
+		writeErr(w, 500, "token 生成失败")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "token": tok})
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
+		return
+	}
+	ip := clientIP(r)
+	if wait, limited := s.authLimit.check(ip); limited {
+		writeRateLimited(w, wait)
 		return
 	}
 	var req struct {
@@ -273,6 +470,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Username != "ARTEX" {
+		s.authLimit.fail(ip)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
@@ -285,11 +483,13 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码未初始化，请先设置密码")
 		return
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+	if err := s.comparePassword(r, hash, req.Password); err != nil {
+		s.authLimit.fail(ip)
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	s.authLimit.success(ip)
+	tok, err := s.signSession(hash)
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return

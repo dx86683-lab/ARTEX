@@ -37,3 +37,15 @@ func TestPreToolUsePassthrough(t *testing.T) {
 }
 
 var _ = hook.PreToolUse
+
+func TestAuditRecordsOneEntryWithFinalOutcome(t *testing.T) {
+	g := New()
+	input, _ := json.Marshal(map[string]string{"command": "id"})
+	if blocked, _, _ := g.Hooks().PreToolUse(context.Background(), "Bash", input); blocked {
+		t.Fatal("unexpected block")
+	}
+	entries := g.Audit()
+	if len(entries) != 1 || entries[0].Action != "allow" || entries[0].Command != "id" {
+		t.Fatalf("entries=%+v", entries)
+	}
+}
